@@ -410,26 +410,76 @@
 
 </div>
 
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
 <script>
 const { createApp } = Vue;
-const LS = {
-  get(k,d){ try{ return JSON.parse(localStorage.getItem(k)) ?? d }catch(e){ return d } },
-  set(k,v){ localStorage.setItem(k, JSON.stringify(v)) }
-};
+
+/* ===== Хранилище: Telegram CloudStorage внутри бота, иначе localStorage ===== */
+const Store = (function(){
+  const tg = window.Telegram && window.Telegram.WebApp;
+  let cloud = null;
+  try {
+    const okVer = !tg.isVersionAtLeast || tg.isVersionAtLeast('6.9');
+    const inTg  = tg && tg.platform && tg.platform !== 'unknown';
+    if (inTg && tg.CloudStorage && okVer) cloud = tg.CloudStorage;
+  } catch(e){}
+
+  const CHUNK = 3500; // у значения CloudStorage лимит ~4096 символов — режем на части
+
+  const cGet = k       => new Promise(r => cloud.getItem(k, (e,v)=> r(e?null:(v||null))));
+  const cSet = (k,v)   => new Promise(r => cloud.setItem(k, v, (e,ok)=> r(!e && ok)));
+  const cDel = k       => new Promise(r => cloud.removeItem(k, ()=> r(true)));
+
+  async function cloudLoad(key){
+    const nRaw = await cGet(key + '.n');
+    if (nRaw === null) return await cGet(key);                 // старый одиночный формат
+    const n = parseInt(nRaw,10) || 0;
+    let s = '';
+    for (let i=0;i<n;i++) s += (await cGet(key + '.' + i)) || '';
+    return s || null;
+  }
+  async function cloudSave(key, val){
+    val = val == null ? '' : String(val);
+    const chunks = [];
+    for (let i=0;i<val.length;i+=CHUNK) chunks.push(val.slice(i,i+CHUNK));
+    if (!chunks.length) chunks.push('');
+    const prev = parseInt(await cGet(key + '.n'),10) || 0;
+    await cSet(key + '.n', String(chunks.length));
+    for (let i=0;i<chunks.length;i++) await cSet(key + '.' + i, chunks[i]);
+    for (let i=chunks.length;i<prev;i++) await cDel(key + '.' + i); // чистим лишние части
+  }
+
+  return {
+    cloud: !!cloud,
+    async load(key, def){
+      try {
+        const raw = cloud ? await cloudLoad(key) : localStorage.getItem(key);
+        return raw == null ? def : JSON.parse(raw);
+      } catch(e){ return def; }
+    },
+    save(key, value){
+      const raw = JSON.stringify(value);
+      if (cloud) cloudSave(key, raw).catch(()=>{});
+      else { try { localStorage.setItem(key, raw); } catch(e){} }
+    }
+  };
+})();
+
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 
 createApp({
   data(){
     return {
       view:'home',
-      players: LS.get('tn_players', []),
-      games: LS.get('tn_games', []),
-      active: LS.get('tn_active', null),
-      p1id: LS.get('tn_p1', null),
-      p2id: LS.get('tn_p2', null),
-      limit: LS.get('tn_limit', 11),
-      winByTwo: LS.get('tn_w2', false),
+      hydrated:false,
+      players: [],
+      games: [],
+      active: null,
+      p1id: null,
+      p2id: null,
+      limit: 11,
+      winByTwo: false,
       limitOptions:[7,11,15,21],
       newName:'',
       picker:0,
@@ -488,18 +538,36 @@ createApp({
     topName(){ return this.standings.length ? this.standings[0].name : '—' },
   },
   watch:{
-    players(v){ LS.set('tn_players',v) },
-    games(v){ LS.set('tn_games',v) },
-    active:{ deep:true, handler(v){ LS.set('tn_active',v) } },
-    p1id(v){ LS.set('tn_p1',v) },
-    p2id(v){ LS.set('tn_p2',v) },
-    limit(v){ LS.set('tn_limit',v) },
-    winByTwo(v){ LS.set('tn_w2',v) },
+    players(v){ if(this.hydrated) Store.save('tn_players', v) },
+    games(v){ if(this.hydrated) Store.save('tn_games', v) },
+    active:{ deep:true, handler(v){
+      if(!this.hydrated) return;
+      clearTimeout(this._at);
+      if(v === null) Store.save('tn_active', null);                       // сразу при завершении
+      else this._at = setTimeout(()=> Store.save('tn_active', v), 300);   // дебаунс на каждом очке
+    }},
+    p1id(v){ if(this.hydrated) Store.save('tn_p1', v) },
+    p2id(v){ if(this.hydrated) Store.save('tn_p2', v) },
+    limit(v){ if(this.hydrated) Store.save('tn_limit', v) },
+    winByTwo(v){ if(this.hydrated) Store.save('tn_w2', v) },
   },
-  mounted(){
-    if(this.active) this.view='game';
-  },
+  created(){ this.hydrate(); },
   methods:{
+    async hydrate(){
+      const [players, games, active, p1id, p2id, limit, winByTwo] = await Promise.all([
+        Store.load('tn_players', []),
+        Store.load('tn_games', []),
+        Store.load('tn_active', null),
+        Store.load('tn_p1', null),
+        Store.load('tn_p2', null),
+        Store.load('tn_limit', 11),
+        Store.load('tn_w2', false),
+      ]);
+      this.players = players; this.games = games; this.active = active;
+      this.p1id = p1id; this.p2id = p2id; this.limit = limit; this.winByTwo = winByTwo;
+      if (active) this.view = 'game';
+      this.$nextTick(()=>{ this.hydrated = true; });
+    },
     initials(n){ return (n||'?').trim().slice(0,2).toUpperCase() },
     addPlayer(){
       const name=this.newName.trim(); if(!name) return;
@@ -558,13 +626,13 @@ createApp({
         winnerId: this.winnerSide===1 ? a.p1Id : a.p2Id,
         startedAt:a.startedAt, endedAt:Date.now(),
       });
-      this.active=null; LS.set('tn_active',null);
+      this.active=null; Store.save('tn_active', null);
       this.range='today';
       this.view='stats';
     },
     confirmQuit(){
       if(confirm('Завершить матч без сохранения?')){
-        this.active=null; LS.set('tn_active',null);
+        this.active=null; Store.save('tn_active', null);
         this.view='home';
       }
     },
@@ -574,6 +642,10 @@ createApp({
     },
   }
 }).mount('#app');
+
+if (window.Telegram && window.Telegram.WebApp) {
+  try { Telegram.WebApp.ready(); Telegram.WebApp.expand(); } catch(e){}
+}
 </script>
 
 </body>
